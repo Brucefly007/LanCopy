@@ -1,0 +1,44 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / PyInstaller
+build/
+dist/
+*.spec
+*.egg
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# Test / type / coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local binaries (Windows folder builds belong on a later GitHub Release)
+*.exe
+*.dll
+*.zip
