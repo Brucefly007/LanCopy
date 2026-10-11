@@ -12,9 +12,7 @@
 
 ## 快速使用（Windows 成品）
 
-当前仓库与 **v0.1.0** 只发布源码和文档。Windows 文件夹版（解压后运行 `局域网复制.exe`）体积较大，可在后续 Release 中附加；本仓库不预置数百 MB 的成品。
-
-1. 下载后续 Release 里的文件夹压缩包，解压后运行 `局域网复制.exe`
+1. 从 [v0.1.0 Release](https://github.com/Brucefly007/LanCopy/releases/tag/v0.1.0) 下载 `LanCopy-windows-x64.zip`，解压后运行 `局域网复制.exe`（请保留旁边的 `_internal` 文件夹）
 2. 虚拟机与宿主机各开一份（网卡需互通，NAT/Host-Only/桥接均可）
 3. 等待状态变为「已连接」后即可复制粘贴
 
