@@ -4,8 +4,9 @@
 局域网复制 (LanCopy)
 - UDP 自动发现 + TCP 传输
 - 文字：即时同步剪贴板
-- 文件：Ctrl+C 只同步元数据(file_offer)；对端 Ctrl+V 时再流式拉取（延迟 CF_HDROP）
-- 大文件：二进制分块（无 base64），边收边写
+- 文件：Ctrl+C 只发名单(file_offer)；对端点「拉取待传文件」才下载到接收目录并写入 CF_HDROP
+  （避免无意复制误传；托盘右键也可拉取；文字仍即时同步）
+- 大文件：二进制分块（无 base64），边收边写，可续传
 """
 
 from __future__ import annotations
@@ -604,8 +605,10 @@ class LanCopyEngine:
         # 拉取等待：req_id -> {event, ok, error, file_path, got, size}
         self._pull_wait: dict[str, dict] = {}
         self._pull_lock = threading.Lock()
-        self._hwnd = 0  # 延迟剪贴板所有者窗口
+        self._hwnd = 0  # 可选：延迟剪贴板窗口（已非主路径）
         self._rendering = False
+        self._auto_pulling_id: Optional[str] = None
+        self._auto_pull_lock = threading.Lock()
 
     def post(self, kind: str, **kw: Any) -> None:
         self.ui_queue.put({"kind": kind, **kw})
@@ -632,7 +635,7 @@ class LanCopyEngine:
         self._want_client = True
         threading.Thread(target=self._client_loop, name="client", daemon=True).start()
         self.log(f"已启动 TCP :{self.port} / UDP :{self.discover_port} id={self.node_id[:8]}…")
-        self.log("文件：复制只同步名单，对端粘贴时再传输内容")
+        self.log("文件：复制只同步名单；对端点「拉取待传文件」（或托盘右键）才下载")
         self.post("status", text="发现中…", connected=False)
         self._publish_peers()
 
@@ -881,9 +884,8 @@ class LanCopyEngine:
         elif t == "file_offer":
             self._on_file_offer(m)
         elif t == "file_offer_autopull":
-            # 对方通过「发送文件/拖放」推送：自动拉到接收目录并放剪贴板
-            self.log("对端请求自动拉取文件名单")
-            threading.Thread(target=self.pull_pending_now, daemon=True).start()
+            # 兼容旧对端：不再自动下载，仍需本机点「拉取」
+            self.log("对端请求推送文件；请本机点「拉取待传文件」或托盘右键拉取")
         elif t == "file_request":
             threading.Thread(target=self._serve_file_request, args=(m, sess), daemon=True).start()
         elif t == "bin_chunk":
@@ -975,7 +977,7 @@ class LanCopyEngine:
             total = sum(f["size"] for f in files_meta)
             self.log(
                 f"→ 文件名单 {len(files_meta)} 个（{self._fmt_size(total)}），"
-                f"对端粘贴时再传内容 offer={offer_id}"
+                f"等待对端点「拉取」 offer={offer_id}"
             )
 
     def _serve_file_request(self, m: dict, sess: PeerSession) -> None:
@@ -1017,6 +1019,7 @@ class LanCopyEngine:
     # ---- 接收端：offer → 延迟剪贴板；粘贴时拉取 ----
 
     def _on_file_offer(self, m: dict) -> None:
+        """收到名单：只缓存，不下载；等用户点「拉取待传文件」或托盘菜单。"""
         offer_id = m.get("offer_id") or ""
         files = m.get("files") or []
         with self._remote_offer_lock:
@@ -1025,20 +1028,44 @@ class LanCopyEngine:
         total = sum(int(f.get("size") or 0) for f in files)
         self.log(
             f"← 文件名单 {len(files)} 个（{self._fmt_size(total)}）：{names}"
-            f"{'…' if len(files) > 5 else ''} — 请在本机 Ctrl+V 粘贴，开始传输"
+            f"{'…' if len(files) > 5 else ''} — 请点「拉取待传文件」或托盘右键拉取"
         )
-        self.post("tray_tip", text=f"对端复制了 {len(files)} 个文件，粘贴时传输")
-        ok = False
-        if self._clip and self._hwnd:
-            ok = self._clip.set_delayed_hdrop(self._hwnd)
-        if not ok and self._clip:
-            # 退化：写入提示文字
-            self._clip.set_text(
-                f"[局域网复制] 对端文件待粘贴传输：{names} （请在支持延迟剪贴板的环境使用，或点「拉取到接收目录」）"
-            )
-            self.log("延迟 CF_HDROP 不可用，已写入文字提示")
-        else:
-            self.log("已放入延迟文件剪贴板（粘贴时拉取）")
+        self.post("pending_offer", count=len(files), total=total, names=names)
+        self.post("tray_tip", text=f"有 {len(files)} 个待传文件，点托盘「拉取待传文件」")
+
+    def _manual_pull_and_set_clipboard(self, offer_id: str) -> None:
+        with self._auto_pull_lock:
+            if self._auto_pulling_id == offer_id:
+                self.log("正在拉取中，请稍候…")
+                return
+            self._auto_pulling_id = offer_id
+        try:
+            with self._remote_offer_lock:
+                offer = self._remote_offer
+            if not offer or (offer.get("offer_id") or "") != offer_id:
+                self.log("没有待传文件名单（可能已过期）")
+                return
+            paths = self._pull_offer_files(offer)
+            if not paths:
+                self.log("← 拉取失败（无文件落地）")
+                return
+            if self._clip and self._clip.set_files(paths):
+                self.log(
+                    f"← 已下载并放入剪贴板 {len(paths)} 个文件，可在本机 Ctrl+V 粘贴"
+                )
+                self.post("tray_tip", text=f"文件已就绪，可粘贴（{len(paths)}）")
+            else:
+                self.log(
+                    f"← 已下载到 {self.recv_dir}，写入剪贴板失败；请到接收目录取文件"
+                )
+                self.post("tray_tip", text="文件已下载到接收目录")
+            self.post("pending_offer", count=0, total=0, names="")
+        except Exception as e:
+            self.log(f"← 拉取异常: {e}")
+        finally:
+            with self._auto_pull_lock:
+                if self._auto_pulling_id == offer_id:
+                    self._auto_pulling_id = None
 
     def render_delayed_hdrop(self) -> bool:
         """WM_RENDERFORMAT 回调：拉取文件并 SetClipboardData(CF_HDROP)。"""
@@ -1217,29 +1244,24 @@ class LanCopyEngine:
             offer = self._remote_offer
         if not offer:
             self.log("没有待传文件名单")
+            self.post("tray_tip", text="没有待传文件")
             return
-
-        def work() -> None:
-            paths = self._pull_offer_files(offer)
-            if paths and self._clip:
-                self._clip.set_files(paths)
-                self.log(f"已拉取并放入剪贴板 {len(paths)} 个文件")
-
-        threading.Thread(target=work, daemon=True).start()
+        offer_id = offer.get("offer_id") or ""
+        threading.Thread(
+            target=self._manual_pull_and_set_clipboard,
+            args=(offer_id,),
+            daemon=True,
+        ).start()
 
     # ---- 主动发送（按钮/拖放）：仍走 offer+立即拉取到对端？改为直接流式推到对端接收目录 ----
     def send_paths(self, paths: list[str]) -> None:
-        """拖放/按钮：推送到对端接收目录（即时传内容），并让对端放剪贴板。"""
+        """拖放/按钮：只发名单，对端需点「拉取待传文件」才下载。"""
         with self._session_lock:
             sess = self._session
         if not sess:
             self.log("未连接，无法发送")
             return
-        # 复用 offer：发名单后对端延迟剪贴板；同时我们在日志提示用户去对端粘贴
-        # 若希望按钮「立即传完」，可在对端自动 pull —— 这里发 offer，并对端自动 pull_pending
         self._send_file_offer(paths)
-        # 通知对端自动拉取（可选消息）
-        sess.send({"type": "file_offer_autopull", "note": "button_or_drop"})
 
     @staticmethod
     def _fmt_size(n: float) -> str:
@@ -1303,48 +1325,63 @@ class App:
         self._init_tray()
 
     def _hook_clipboard_render(self, hwnd: int) -> None:
+        """可选保留延迟渲染钩子；文件主路径已改为自动拉取。
+
+        64 位 HWND/WNDPROC 必须用 pointer-sized ctypes，禁止把 .value 当 int 传入。
+        """
         if not _HAS_WIN32 or self._render_hooked:
             return
         import ctypes
         from ctypes import wintypes
 
-        user32 = ctypes.windll.user32
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
         WM_RENDERFORMAT = 0x0306
         WM_RENDERALLFORMATS = 0x0307
         GWL_WNDPROC = -4
+        HWND = ctypes.c_void_p
+        LRESULT = ctypes.c_ssize_t
         if ctypes.sizeof(ctypes.c_void_p) == 8:
             _set = user32.SetWindowLongPtrW
             _get = user32.GetWindowLongPtrW
         else:
             _set = user32.SetWindowLongW
             _get = user32.GetWindowLongW
-        _set.restype = ctypes.c_void_p
+        _get.argtypes = [HWND, ctypes.c_int]
         _get.restype = ctypes.c_void_p
-        LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
-        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
-        old = _get(wintypes.HWND(hwnd), GWL_WNDPROC)
+        _set.argtypes = [HWND, ctypes.c_int, ctypes.c_void_p]
+        _set.restype = ctypes.c_void_p
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.CallWindowProcW.restype = LRESULT
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        hwnd_p = HWND(hwnd)
+        old = _get(hwnd_p, GWL_WNDPROC)
         if not old:
-            raise RuntimeError("GetWindowLong 失败")
+            raise RuntimeError("GetWindowLongPtr 失败")
         app = self
+        old_proc = ctypes.c_void_p(old)
 
         @WNDPROC
         def wndproc(h, msg, wp, lp):
             if msg in (WM_RENDERFORMAT, WM_RENDERALLFORMATS):
-                # CF_HDROP == 15
                 if msg == WM_RENDERALLFORMATS or int(wp) == win32con.CF_HDROP:
                     try:
-                        # 渲染期间系统已 OpenClipboard
                         app.engine.render_delayed_hdrop()
                     except Exception:
-                        app.root.after(0, lambda: app._append_log("延迟渲染失败:\n" + traceback.format_exc()))
+                        app.root.after(
+                            0,
+                            lambda: app._append_log(
+                                "延迟渲染失败:\n" + traceback.format_exc()
+                            ),
+                        )
                     return 0
-            return user32.CallWindowProcW(ctypes.c_void_p(old), h, msg, wp, lp)
+            return user32.CallWindowProcW(old_proc, h, msg, wp, lp)
 
         self._clip_wndproc = wndproc
-        self._clip_old_proc = old
-        _set(wintypes.HWND(hwnd), GWL_WNDPROC, ctypes.cast(wndproc, ctypes.c_void_p).value)
+        self._clip_old_proc = old_proc
+        new_proc = ctypes.cast(wndproc, ctypes.c_void_p)
+        _set(hwnd_p, GWL_WNDPROC, new_proc)
         self._render_hooked = True
-        self._append_log("已挂钩延迟剪贴板渲染（粘贴时传文件）")
+        self._append_log(f"窗口就绪 hwnd=0x{hwnd:X}")
 
     def _build(self) -> None:
         pad = {"padx": 6, "pady": 3}
@@ -1397,10 +1434,25 @@ class App:
         ttk.Label(row4, text="状态:").pack(side=tk.LEFT)
         self.var_status = tk.StringVar(value="启动中…")
         ttk.Label(row4, textvariable=self.var_status, foreground="#0a0").pack(side=tk.LEFT, padx=4)
-        ttk.Button(row4, text="拉取待传文件", command=self._pull_pending).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(row4, text="发送文件…", command=self._pick_files).pack(side=tk.RIGHT)
+        ttk.Button(row4, text="发送文件…", command=self._pick_files).pack(side=tk.RIGHT, padx=2)
+        # 醒目「拉取」：缩托盘时用右键同名菜单
+        self.btn_pull = tk.Button(
+            row4,
+            text="⬇ 拉取待传文件",
+            command=self._pull_pending,
+            bg="#1a7f37",
+            fg="white",
+            activebackground="#146c2e",
+            activeforeground="white",
+            relief=tk.RAISED,
+            padx=10,
+            pady=2,
+        )
+        self.btn_pull.pack(side=tk.RIGHT, padx=4)
+        self.var_pending = tk.StringVar(value="")
+        ttk.Label(row4, textvariable=self.var_pending, foreground="#c60").pack(side=tk.RIGHT, padx=6)
 
-        tip = "文字即时同步；文件复制只传名单，对端 Ctrl+V 粘贴时才传内容（二进制分块，支持大文件/续传）。"
+        tip = "文字即时同步；文件复制只传名单，对端点「拉取待传文件」（窗口按钮或托盘右键）才下载，避免误传。"
         if _HAS_TRAY:
             tip += " 关闭/最小化进托盘。"
         ttk.Label(frm, text=tip, foreground="#666", wraplength=600).pack(anchor=tk.W, padx=6)
@@ -1415,7 +1467,7 @@ class App:
         self.log.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
         self._enable_dnd(self.log)
 
-        self._append_log(f"{APP_NAME} 已就绪。自动发现同伴；文件粘贴时再传输。")
+        self._append_log(f"{APP_NAME} 已就绪。自动发现同伴；文件需点「拉取待传文件」或托盘右键才下载。")
         self._append_log(f"本机 IP: {' / '.join(ips)}  TCP {DEFAULT_PORT} / UDP {DISCOVER_PORT}")
 
     def _enable_dnd(self, widget: Any) -> None:
@@ -1432,7 +1484,7 @@ class App:
                             f = f.decode("utf-8", errors="ignore")
                     paths.append(str(f))
                 if paths:
-                    self._append_log(f"拖入 {len(paths)} 项 → 发名单到对端（请对端粘贴接收）")
+                    self._append_log(f"拖入 {len(paths)} 项 → 发名单到对端（请对端点「拉取」）")
                     threading.Thread(target=self.engine.send_paths, args=(paths,), daemon=True).start()
 
             windnd.hook_dropfiles(widget, func=_drop)
@@ -1512,6 +1564,24 @@ class App:
                 elif kind == "progress":
                     self.prog["value"] = float(msg.get("value") or 0)
                     self.var_prog.set(msg.get("text") or "")
+                elif kind == "pending_offer":
+                    n = int(msg.get("count") or 0)
+                    if n > 0:
+                        names = msg.get("names") or ""
+                        self.var_pending.set(f"待传 {n} 个" + (f"：{names}" if names else ""))
+                        try:
+                            self.btn_pull.config(bg="#d97706", activebackground="#b45309")
+                        except Exception:
+                            pass
+                        if not self.root.winfo_viewable():
+                            # 缩在托盘时额外提醒一次
+                            self._tray_notify(msg.get("names") and f"有待传文件：{names}" or f"有 {n} 个待传文件")
+                    else:
+                        self.var_pending.set("")
+                        try:
+                            self.btn_pull.config(bg="#1a7f37", activebackground="#146c2e")
+                        except Exception:
+                            pass
                 elif kind == "tray_tip":
                     self._tray_notify(msg.get("text") or "")
                 elif kind == "open_dir":
