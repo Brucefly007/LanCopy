@@ -5,7 +5,8 @@
 - UDP 自动发现 + TCP 传输
 - 文字：即时同步剪贴板
 - 图片：QQ/微信等右键复制的位图/PNG（CF_DIB / PNG 等）即时同步，对端可直接 Ctrl+V
-- 文件：Ctrl+C 只发名单(file_offer)；对端顶部置顶弹窗点「拉取」才下载到接收目录并写入 CF_HDROP
+- 文件：Ctrl+C 只发名单(file_offer)；对端顶部置顶弹窗点「拉取」后同窗切进度条（字节/%），
+  传完立刻自动关（最多闪一下「完成」）；失败短暂提示后关或可点关闭
   （避免无意复制误传；托盘右键仍可拉取备用）
 - 大文件：二进制分块（无 base64），边收边写，可续传
 - 单实例：Windows 命名互斥量，二次启动激活已有窗口
@@ -1269,10 +1270,21 @@ class LanCopyEngine:
                 offer = self._remote_offer
             if not offer or (offer.get("offer_id") or "") != offer_id:
                 self.log("没有待传文件名单（可能已过期）")
+                self.post("pull_fail", text="没有待传文件名单（可能已过期）")
                 return
-            paths = self._pull_offer_files(offer)
+            files = offer.get("files") or []
+            total_bytes = sum(int(f.get("size") or 0) for f in files)
+            self.post(
+                "pull_progress",
+                value=0,
+                got=0,
+                total=total_bytes,
+                text=f"开始拉取… 0/{self._fmt_size(total_bytes)}",
+            )
+            paths = self._pull_offer_files(offer, overall_total=total_bytes)
             if not paths:
                 self.log("← 拉取失败（无文件落地）")
+                self.post("pull_fail", text="拉取失败（无文件落地）")
                 return
             if self._clip and self._clip.set_files(paths):
                 self.log(
@@ -1284,14 +1296,19 @@ class LanCopyEngine:
                     f"← 已下载到 {self.recv_dir}，写入剪贴板失败；请到接收目录取文件"
                 )
                 self.post("tray_tip", text="文件已下载到接收目录")
-            self.post("pending_offer", count=0, total=0, names="")
+            with self._remote_offer_lock:
+                if self._remote_offer and (self._remote_offer.get("offer_id") or "") == offer_id:
+                    self._remote_offer = None
+            # keep_popup：清待传状态但不立刻拆弹窗（由 pull_done 关）
+            self.post("pending_offer", count=0, total=0, names="", keep_popup=True)
+            self.post("pull_done", text=f"完成 {len(paths)} 个文件", value=100)
         except Exception as e:
             self.log(f"← 拉取异常: {e}")
+            self.post("pull_fail", text=f"拉取异常: {e}")
         finally:
             with self._auto_pull_lock:
                 if self._auto_pulling_id == offer_id:
                     self._auto_pulling_id = None
-
     def render_delayed_hdrop(self) -> bool:
         """WM_RENDERFORMAT 回调：拉取文件并 SetClipboardData(CF_HDROP)。"""
         if self._rendering:
@@ -1349,10 +1366,13 @@ class LanCopyEngine:
             self.log(f"写入 HDROP 失败: {e}")
             return False
 
-    def _pull_offer_files(self, offer: dict) -> list[str]:
+    def _pull_offer_files(self, offer: dict, overall_total: int = 0) -> list[str]:
         offer_id = offer.get("offer_id") or ""
         files = offer.get("files") or []
         out_paths: list[str] = []
+        if overall_total <= 0:
+            overall_total = sum(int(f.get("size") or 0) for f in files)
+        overall_done = 0
         for meta in files:
             fid = meta.get("id") or ""
             name = (meta.get("name") or "file").replace("\\", "/")
@@ -1360,30 +1380,58 @@ class LanCopyEngine:
             size = int(meta.get("size") or 0)
             dest = self.recv_dir / name
             dest.parent.mkdir(parents=True, exist_ok=True)
-            # 断点：已有部分文件则续传
             offset = 0
             if dest.exists():
                 existing = dest.stat().st_size
                 if existing == size and size > 0:
                     out_paths.append(str(dest.resolve()))
+                    overall_done += size
                     self.log(f"← 已存在完整文件，跳过: {name}")
+                    pct = (overall_done / overall_total * 100) if overall_total else 100
+                    self.post(
+                        "pull_progress",
+                        value=pct,
+                        got=overall_done,
+                        total=overall_total,
+                        text=(
+                            f"跳过已有 {name}  "
+                            f"{self._fmt_size(overall_done)}/{self._fmt_size(overall_total)}"
+                        ),
+                    )
                     continue
                 if existing < size:
                     offset = existing
                     self.log(f"← 续传 {name} 从 {self._fmt_size(offset)}")
                 else:
-                    # 尺寸异常，重写
                     offset = 0
-            ok = self._pull_one_file(offer_id, fid, dest, size, offset)
+            ok = self._pull_one_file(
+                offer_id,
+                fid,
+                dest,
+                size,
+                offset,
+                overall_base=overall_done,
+                overall_total=overall_total,
+            )
             if ok:
                 out_paths.append(str(dest.resolve()))
+                overall_done += size
             else:
                 self.log(f"← 拉取失败: {name}")
+                break
         if out_paths and self.open_after_recv:
             self.post("open_dir", path=str(Path(out_paths[0]).parent))
         return out_paths
-
-    def _pull_one_file(self, offer_id: str, file_id: str, dest: Path, size: int, offset: int) -> bool:
+    def _pull_one_file(
+        self,
+        offer_id: str,
+        file_id: str,
+        dest: Path,
+        size: int,
+        offset: int,
+        overall_base: int = 0,
+        overall_total: int = 0,
+    ) -> bool:
         with self._session_lock:
             sess = self._session
         if not sess:
@@ -1415,17 +1463,30 @@ class LanCopyEngine:
             with self._pull_lock:
                 self._pull_wait.pop(req_id, None)
             return False
-        # 大文件可能很久；最多等 24h
-        while not done.wait(0.5):
+        ot = overall_total or size or 1
+
+        def _emit(got_file: int) -> None:
+            overall_got = overall_base + got_file
+            pct = min(100.0, overall_got / ot * 100) if ot else 100.0
+            text = (
+                f"下载 {dest.name}  "
+                f"{self._fmt_size(got_file)}/{self._fmt_size(size)}  "
+                f"合计 {self._fmt_size(overall_got)}/{self._fmt_size(ot)}  ({pct:.1f}%)"
+            )
+            self.post("progress", value=pct, text=text)
+            self.post(
+                "pull_progress",
+                value=pct,
+                got=overall_got,
+                total=ot,
+                text=text,
+            )
+
+        _emit(offset)
+        while not done.wait(0.2):
             if not self._running or not sess._alive:
                 break
-            got = state["got"]
-            sz = state["size"] or 1
-            self.post(
-                "progress",
-                value=min(100.0, got / sz * 100),
-                text=f"下载 {dest.name}  {self._fmt_size(got)}/{self._fmt_size(sz)}",
-            )
+            _emit(int(state["got"] or 0))
         try:
             state["fh"].close()
         except Exception:
@@ -1433,11 +1494,10 @@ class LanCopyEngine:
         with self._pull_lock:
             self._pull_wait.pop(req_id, None)
         if state["ok"]:
-            self.post("progress", value=100, text=f"完成 {dest.name}")
+            _emit(size if size > 0 else int(state["got"] or 0))
             return True
         self.log(f"拉取中断: {state.get('error')}")
         return False
-
     def _on_bin_chunk(self, m: dict) -> None:
         req_id = m.get("req_id") or ""
         with self._pull_lock:
@@ -1532,6 +1592,11 @@ class App:
         self._tray_state = "idle"
         self._render_hooked = False
         self._pull_popup = None  # type: ignore
+        self._pull_popup_mode = None  # "confirm" | "progress" | "done" | "fail"
+        self._pull_popup_label = None  # type: ignore
+        self._pull_popup_prog = None  # type: ignore
+        self._pull_popup_btns = None  # type: ignore
+        self._pull_popup_after_id = None  # type: ignore
         self._instance_mutex = None
 
         self._build()
@@ -1784,16 +1849,31 @@ class App:
             threading.Thread(target=self.engine.send_paths, args=(list(files),), daemon=True).start()
 
     def _pull_pending(self) -> None:
-        self._close_pull_popup()
+        # 不关弹窗：切到进度视图，由真实 pull_progress / pull_done / pull_fail 驱动
+        self._switch_pull_popup_to_progress()
         self.engine.pull_pending_now()
 
     def _cancel_pending(self) -> None:
+        # 确认阶段取消：丢弃 offer 并关弹窗；进度中取消仅关 UI（传输继续，保持简单）
+        mode = self._pull_popup_mode
         self._close_pull_popup()
-        self.engine.discard_pending_offer()
+        if mode != "progress":
+            self.engine.discard_pending_offer()
 
     def _close_pull_popup(self) -> None:
+        aid = self._pull_popup_after_id
+        self._pull_popup_after_id = None
+        if aid is not None:
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
         win = self._pull_popup
         self._pull_popup = None
+        self._pull_popup_mode = None
+        self._pull_popup_label = None
+        self._pull_popup_prog = None
+        self._pull_popup_btns = None
         if win is not None:
             try:
                 win.destroy()
@@ -1801,11 +1881,12 @@ class App:
                 pass
 
     def _show_pull_popup(self, count: int, total: int, names: str) -> None:
-        """屏幕正上方中间、置顶覆盖其他窗口的拉取确认条。"""
+        """屏幕正上方中间、置顶覆盖其他窗口的拉取确认条（点拉取后同窗切进度）。"""
         self._close_pull_popup()
         _ensure_tk()
         win = tk.Toplevel(self.root)
         self._pull_popup = win
+        self._pull_popup_mode = "confirm"
         win.title("待传文件")
         win.resizable(False, False)
         try:
@@ -1816,7 +1897,6 @@ class App:
             win.attributes("-toolwindow", True)
         except Exception:
             pass
-        # 最高优先级：短暂置顶 + lift + 强制前台
         try:
             win.lift()
             win.focus_force()
@@ -1829,13 +1909,21 @@ class App:
             size_txt = f"（{self.engine._fmt_size(total)}）" if total else ""
         except Exception:
             size_txt = ""
-        label = (
+        text = (
             f"对端有 {count} 个文件待传输{size_txt}"
             + (f"：{names}" if names else "")
         )
-        ttk.Label(frm, text=label, wraplength=420).pack(anchor=tk.W, pady=(0, 10))
+        label = ttk.Label(frm, text=text, wraplength=420)
+        label.pack(anchor=tk.W, pady=(0, 8))
+        self._pull_popup_label = label
+
+        prog = ttk.Progressbar(frm, mode="determinate", maximum=100, length=420)
+        # 确认阶段先不显示进度条
+        self._pull_popup_prog = prog
+
         btns = ttk.Frame(frm)
         btns.pack(fill=tk.X)
+        self._pull_popup_btns = btns
         pull_btn = tk.Button(
             btns,
             text="拉取",
@@ -1854,34 +1942,182 @@ class App:
             command=self._cancel_pending,
         )
         cancel_btn.pack(side=tk.LEFT)
-        win.update_idletasks()
-        w = max(win.winfo_reqwidth(), 460)
-        h = win.winfo_reqheight()
-        sw = win.winfo_screenwidth()
-        x = max(0, (sw - w) // 2)
-        y = 12  # 屏幕正上方中间
-        win.geometry(f"{w}x{h}+{x}+{y}")
-        # Windows: 置顶置前
-        if sys.platform == "win32":
-            try:
-                import ctypes
-
-                user32 = ctypes.windll.user32
-                hwnd = ctypes.c_void_p(int(win.winfo_id()))
-                parent = user32.GetParent(hwnd)
-                top = hwnd
-                while parent:
-                    top = ctypes.c_void_p(parent)
-                    parent = user32.GetParent(top)
-                HWND_TOPMOST = ctypes.c_void_p(-1)
-                SWP_NOMOVE = 0x0002
-                SWP_NOSIZE = 0x0001
-                SWP_SHOWWINDOW = 0x0040
-                user32.SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-            except Exception:
-                pass
+        self._position_pull_popup(win)
+        self._force_pull_popup_topmost(win)
         win.protocol("WM_DELETE_WINDOW", self._cancel_pending)
 
+    def _position_pull_popup(self, win) -> None:
+        try:
+            win.update_idletasks()
+            w = max(win.winfo_reqwidth(), 480)
+            h = win.winfo_reqheight()
+            sw = win.winfo_screenwidth()
+            x = max(0, (sw - w) // 2)
+            y = 12
+            win.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _force_pull_popup_topmost(self, win) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = ctypes.c_void_p(int(win.winfo_id()))
+            parent = user32.GetParent(hwnd)
+            top = hwnd
+            while parent:
+                top = ctypes.c_void_p(parent)
+                parent = user32.GetParent(top)
+            HWND_TOPMOST = ctypes.c_void_p(-1)
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_SHOWWINDOW = 0x0040
+            user32.SetWindowPos(
+                top, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+            )
+        except Exception:
+            pass
+
+    def _switch_pull_popup_to_progress(self) -> None:
+        win = self._pull_popup
+        if win is None:
+            # 无确认弹窗时也造一个进度窗
+            self._show_pull_popup(0, 0, "")
+            win = self._pull_popup
+        if win is None:
+            return
+        self._pull_popup_mode = "progress"
+        try:
+            win.title("正在拉取")
+        except Exception:
+            pass
+        label = self._pull_popup_label
+        if label is not None:
+            try:
+                label.config(text="开始拉取…")
+            except Exception:
+                pass
+        prog = self._pull_popup_prog
+        if prog is not None:
+            try:
+                if not prog.winfo_ismapped():
+                    prog.pack(fill=tk.X, pady=(0, 8), before=self._pull_popup_btns)
+                prog["value"] = 0
+            except Exception:
+                try:
+                    prog.pack(fill=tk.X, pady=(0, 8))
+                    prog["value"] = 0
+                except Exception:
+                    pass
+        btns = self._pull_popup_btns
+        if btns is not None:
+            try:
+                for child in btns.winfo_children():
+                    child.destroy()
+                # 进度中可关 UI；传输本身不中断（保持简单）
+                tk.Button(btns, text="隐藏", width=10, command=self._cancel_pending).pack(
+                    side=tk.LEFT
+                )
+            except Exception:
+                pass
+        self._position_pull_popup(win)
+        self._force_pull_popup_topmost(win)
+
+    def _update_pull_popup_progress(self, value: float, text: str) -> None:
+        if self._pull_popup is None:
+            return
+        if self._pull_popup_mode not in ("progress", "done"):
+            # 托盘拉取等：尚无进度视图则切过去
+            self._switch_pull_popup_to_progress()
+        label = self._pull_popup_label
+        prog = self._pull_popup_prog
+        if label is not None:
+            try:
+                label.config(text=text or "")
+            except Exception:
+                pass
+        if prog is not None:
+            try:
+                prog["value"] = float(value or 0)
+            except Exception:
+                pass
+
+    def _finish_pull_popup_ok(self, text: str = "完成") -> None:
+        """传完：最多闪一下「完成」立刻关，不长时间停留。"""
+        win = self._pull_popup
+        if win is None:
+            return
+        self._pull_popup_mode = "done"
+        label = self._pull_popup_label
+        prog = self._pull_popup_prog
+        if label is not None:
+            try:
+                label.config(text=text or "完成")
+            except Exception:
+                pass
+        if prog is not None:
+            try:
+                prog["value"] = 100
+            except Exception:
+                pass
+        btns = self._pull_popup_btns
+        if btns is not None:
+            try:
+                for child in btns.winfo_children():
+                    child.destroy()
+            except Exception:
+                pass
+        # 取消旧定时；约 250ms 闪一下后关
+        aid = self._pull_popup_after_id
+        if aid is not None:
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+        self._pull_popup_after_id = self.root.after(250, self._close_pull_popup)
+
+    def _finish_pull_popup_fail(self, text: str) -> None:
+        """失败：短暂显示错误，可点关闭；同时约 2.5s 后自动关。"""
+        win = self._pull_popup
+        if win is None:
+            # 无弹窗也弹一下错误再关
+            self._show_pull_popup(0, 0, "")
+            win = self._pull_popup
+            self._switch_pull_popup_to_progress()
+        if win is None:
+            return
+        self._pull_popup_mode = "fail"
+        try:
+            win.title("拉取失败")
+        except Exception:
+            pass
+        label = self._pull_popup_label
+        if label is not None:
+            try:
+                label.config(text=text or "拉取失败")
+            except Exception:
+                pass
+        btns = self._pull_popup_btns
+        if btns is not None:
+            try:
+                for child in btns.winfo_children():
+                    child.destroy()
+                tk.Button(btns, text="关闭", width=10, command=self._close_pull_popup).pack(
+                    side=tk.LEFT
+                )
+            except Exception:
+                pass
+        self._position_pull_popup(win)
+        aid = self._pull_popup_after_id
+        if aid is not None:
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+        self._pull_popup_after_id = self.root.after(2500, self._close_pull_popup)
     def _auto_start(self) -> None:
         try:
             self._connect()
@@ -1948,7 +2184,9 @@ class App:
                             self.btn_pull.config(bg="#d97706", activebackground="#b45309")
                         except Exception:
                             pass
-                        self._show_pull_popup(n, total, names)
+                        # 进度中勿被新名单重建弹窗打断
+                        if self._pull_popup_mode != "progress":
+                            self._show_pull_popup(n, total, names)
                         self._tray_notify(msg.get("names") and f"有待传文件：{names}" or f"有 {n} 个待传文件")
                     else:
                         self.var_pending.set("")
@@ -1956,7 +2194,24 @@ class App:
                             self.btn_pull.config(bg="#1a7f37", activebackground="#146c2e")
                         except Exception:
                             pass
-                        self._close_pull_popup()
+                        # keep_popup：拉取成功清名单时由 pull_done 关窗，不要这里立刻拆掉
+                        if not msg.get("keep_popup"):
+                            self._close_pull_popup()
+                elif kind == "pull_progress":
+                    self._update_pull_popup_progress(
+                        float(msg.get("value") or 0),
+                        msg.get("text") or "",
+                    )
+                    # 主窗口进度条同步
+                    self.prog["value"] = float(msg.get("value") or 0)
+                    self.var_prog.set(msg.get("text") or "")
+                elif kind == "pull_done":
+                    self.prog["value"] = float(msg.get("value") or 100)
+                    self.var_prog.set(msg.get("text") or "完成")
+                    self._finish_pull_popup_ok(msg.get("text") or "完成")
+                elif kind == "pull_fail":
+                    self.var_prog.set(msg.get("text") or "拉取失败")
+                    self._finish_pull_popup_fail(msg.get("text") or "拉取失败")
                 elif kind == "tray_tip":
                     self._tray_notify(msg.get("text") or "")
                 elif kind == "open_dir":
