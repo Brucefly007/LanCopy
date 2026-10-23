@@ -4,14 +4,17 @@
 局域网复制 (LanCopy)
 - UDP 自动发现 + TCP 传输
 - 文字：即时同步剪贴板
-- 文件：Ctrl+C 只发名单(file_offer)；对端点「拉取待传文件」才下载到接收目录并写入 CF_HDROP
-  （避免无意复制误传；托盘右键也可拉取；文字仍即时同步）
+- 图片：QQ/微信等右键复制的位图/PNG（CF_DIB / PNG 等）即时同步，对端可直接 Ctrl+V
+- 文件：Ctrl+C 只发名单(file_offer)；对端顶部置顶弹窗点「拉取」才下载到接收目录并写入 CF_HDROP
+  （避免无意复制误传；托盘右键仍可拉取备用）
 - 大文件：二进制分块（无 base64），边收边写，可续传
+- 单实例：Windows 命名互斥量，二次启动激活已有窗口
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import queue
@@ -36,15 +39,19 @@ try:
 except Exception:
     _HAS_WIN32 = False
 
+Image = ImageDraw = None  # type: ignore
+try:
+    from PIL import Image, ImageDraw  # type: ignore
+except Exception:
+    Image = ImageDraw = None  # type: ignore
+
 _HAS_TRAY = False
 try:
     import pystray  # type: ignore
-    from PIL import Image, ImageDraw  # type: ignore
 
     _HAS_TRAY = True
 except Exception:
     pystray = None  # type: ignore
-    Image = ImageDraw = None  # type: ignore
 
 tk = None  # type: ignore
 ttk = filedialog = messagebox = scrolledtext = None  # type: ignore
@@ -64,7 +71,7 @@ APP_NAME = "局域网复制"
 DEFAULT_PORT = 3721
 DISCOVER_PORT = 3722
 CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB 二进制块
-PROTO_VERSION = 2
+PROTO_VERSION = 3
 HEADER = struct.Struct(">I")
 DISCOVER_TYPE = "lan_copy_hello"
 DISCOVER_INTERVAL = 2.0
@@ -148,6 +155,18 @@ def make_clipboard_text(text: str, seq: int) -> dict:
         "text": text,
         "hash": clipboard_text_hash(text),
         "seq": seq,
+    }
+
+
+def make_clipboard_image(n: int, img_hash: str, seq: int, fmt: str = "png") -> dict:
+    """JSON 头后紧跟 n 字节原始图片（默认 PNG）。"""
+    return {
+        "type": "clipboard_image",
+        "format": fmt,
+        "n": int(n),
+        "hash": img_hash,
+        "seq": int(seq),
+        "ver": PROTO_VERSION,
     }
 
 
@@ -256,14 +275,73 @@ def build_hdrop_blob(paths: list[str]) -> bytes:
 
 # ============================== 剪贴板 ==============================
 
+def clipboard_bytes_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _dib_to_png(dib: bytes) -> Optional[bytes]:
+    """CF_DIB (BITMAPINFOHEADER + pixels) -> PNG bytes via Pillow。"""
+    if not dib or Image is None:
+        return None
+    try:
+        # BMP file = 14-byte BITMAPFILEHEADER + DIB
+        header_size = int.from_bytes(dib[0:4], "little")
+        if header_size < 40:
+            return None
+        # Estimate pixel offset: 14 + header_size + color table
+        biBitCount = int.from_bytes(dib[14:16], "little") if len(dib) >= 16 else 24
+        biClrUsed = int.from_bytes(dib[32:36], "little") if len(dib) >= 36 else 0
+        if biBitCount <= 8:
+            ncolors = biClrUsed or (1 << biBitCount)
+        else:
+            ncolors = biClrUsed
+        pixel_offset = 14 + header_size + ncolors * 4
+        file_size = 14 + len(dib)
+        bf = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, pixel_offset)
+        img = Image.open(io.BytesIO(bf + dib))
+        img.load()
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+        out = io.BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def _png_to_dib(png: bytes) -> Optional[bytes]:
+    if not png or Image is None:
+        return None
+    try:
+        img = Image.open(io.BytesIO(png))
+        img.load()
+        if img.mode == "RGBA":
+            # CF_DIB typically without alpha; keep RGB for broad paste
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[3])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="BMP")
+        data = buf.getvalue()
+        if len(data) > 14 and data[:2] == b"BM":
+            return data[14:]  # strip BITMAPFILEHEADER
+        return None
+    except Exception:
+        return None
+
+
 
 class ClipboardHelper:
     def __init__(self, root: Any):
         self.root = root
         self._last_set_hash: Optional[str] = None
         self._last_set_files_sig: Optional[str] = None
+        self._last_set_image_hash: Optional[str] = None
         self._suppress_until = 0.0
         self._seq = 0
+        self._png_fmt = None
 
     def get_text(self) -> Optional[str]:
         if _HAS_WIN32:
@@ -296,6 +374,7 @@ class ClipboardHelper:
         h = clipboard_text_hash(text)
         self._last_set_hash = h
         self._last_set_files_sig = None
+        self._last_set_image_hash = None
         self._suppress_until = time.time() + 2.0
         if _HAS_WIN32:
             try:
@@ -327,6 +406,7 @@ class ClipboardHelper:
         sig = "|".join(paths)
         self._last_set_files_sig = sig
         self._last_set_hash = None
+        self._last_set_image_hash = None
         self._suppress_until = time.time() + 2.0
         if not _HAS_WIN32:
             self.set_text(chr(10).join(paths))
@@ -402,6 +482,95 @@ class ClipboardHelper:
             except Exception:
                 pass
             return False
+
+
+    def _png_clipboard_format(self) -> int:
+        if self._png_fmt is None:
+            self._png_fmt = win32clipboard.RegisterClipboardFormat("PNG")
+        return int(self._png_fmt)
+
+    def get_image_png(self) -> Optional[bytes]:
+        """读取剪贴板图片为 PNG（优先 PNG 格式，其次 CF_DIB；QQ/微信右键复制常用）。"""
+        if not _HAS_WIN32:
+            return None
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                # 有真实文件列表时不当成图片（Explorer 复制）
+                if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
+                    return None
+                # PNG 自定义格式（Chrome/QQ/微信等）
+                try:
+                    fmt = self._png_clipboard_format()
+                    if win32clipboard.IsClipboardFormatAvailable(fmt):
+                        data = win32clipboard.GetClipboardData(fmt)
+                        if data:
+                            raw = bytes(data) if not isinstance(data, (bytes, bytearray)) else bytes(data)
+                            if raw[:8] == b"\x89PNG\r\n\x1a\n" or raw[:4] == b"\x89PNG":
+                                return raw
+                            if len(raw) > 24:
+                                return raw
+                except Exception:
+                    pass
+                # CF_DIB
+                if win32clipboard.IsClipboardFormatAvailable(win32con.CF_DIB):
+                    dib = win32clipboard.GetClipboardData(win32con.CF_DIB)
+                    if dib:
+                        raw = bytes(dib) if not isinstance(dib, (bytes, bytearray)) else bytes(dib)
+                        png = _dib_to_png(raw)
+                        if png:
+                            return png
+            finally:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+        return None
+
+    def set_image_png(self, png: bytes) -> bool:
+        """写入 PNG + CF_DIB，便于对端粘贴到 QQ/微信/文档。"""
+        if not png:
+            return False
+        h = clipboard_bytes_hash(png)
+        self._last_set_image_hash = h
+        self._last_set_hash = None
+        self._last_set_files_sig = None
+        self._suppress_until = time.time() + 2.0
+        if not _HAS_WIN32:
+            return False
+        dib = _png_to_dib(png)
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                fmt = self._png_clipboard_format()
+                win32clipboard.SetClipboardData(fmt, png)
+                if dib:
+                    win32clipboard.SetClipboardData(win32con.CF_DIB, dib)
+            finally:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+            # 退路：落盘再当文件（一般不会走到）
+            return False
+
+    def should_ignore_image(self, png: bytes) -> bool:
+        if not png:
+            return True
+        h = clipboard_bytes_hash(png)
+        return bool(self._last_set_image_hash and h == self._last_set_image_hash)
 
     def should_ignore_local(self, text: str) -> bool:
         h = clipboard_text_hash(text)
@@ -504,6 +673,20 @@ class PeerSession:
                 self.close()
                 return False
 
+    def send_clipboard_image(self, png: bytes, img_hash: str, seq: int) -> bool:
+        if not self._alive or not png:
+            return False
+        hdr = encode_frame(make_clipboard_image(len(png), img_hash, seq, "png"))
+        with self._send_lock:
+            try:
+                self.sock.sendall(hdr)
+                self.sock.sendall(png)
+                return True
+            except Exception as e:
+                self.log(f"发送图片失败: {e}")
+                self.close()
+                return False
+
     def _recv_exact_from_buf(self, n: int) -> Optional[bytes]:
         """从已有缓冲或 socket 再读，凑齐 n 字节。"""
         while len(self._buf) < n and self._alive:
@@ -538,7 +721,7 @@ class PeerSession:
                         return
                     if msg is None:
                         break
-                    if msg.get("type") == "bin_chunk":
+                    if msg.get("type") in ("bin_chunk", "clipboard_image"):
                         n = int(msg.get("n") or 0)
                         raw = self._recv_exact_from_buf(n)
                         if raw is None:
@@ -596,6 +779,7 @@ class LanCopyEngine:
         self._clip: Optional[ClipboardHelper] = None
         self._last_clip_hash: Optional[str] = None
         self._last_hdrop_sig: Optional[str] = None
+        self._last_image_hash: Optional[str] = None
 
         # 本机作为「复制源」：offer_id -> {file_id: Path}
         self._local_offers: dict[str, dict[str, Path]] = {}
@@ -635,7 +819,8 @@ class LanCopyEngine:
         self._want_client = True
         threading.Thread(target=self._client_loop, name="client", daemon=True).start()
         self.log(f"已启动 TCP :{self.port} / UDP :{self.discover_port} id={self.node_id[:8]}…")
-        self.log("文件：复制只同步名单；对端点「拉取待传文件」（或托盘右键）才下载")
+        self.log("文件：复制只同步名单；对端顶部弹窗点「拉取」才下载（托盘右键备用）")
+        self.log("图片：QQ/微信等剪贴板图片会即时同步到对端")
         self.post("status", text="发现中…", connected=False)
         self._publish_peers()
 
@@ -881,6 +1066,25 @@ class LanCopyEngine:
                 self._clip.set_text(text)
             preview = text.replace("\n", " ")[:80]
             self.log(f"← 文字 ({len(text)} 字): {preview}")
+        elif t == "clipboard_image":
+            data = m.get("_data") or b""
+            img_hash = m.get("hash") or clipboard_bytes_hash(data)
+            if data and self._clip:
+                self._last_image_hash = img_hash
+                ok = self._clip.set_image_png(data)
+                if ok:
+                    self.log(f"← 图片 ({self._fmt_size(len(data))})，可直接 Ctrl+V 粘贴到 QQ/微信等")
+                else:
+                    dest = self.recv_dir / f"clip_{img_hash[:10]}.png"
+                    try:
+                        self.recv_dir.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(data)
+                        self._clip.set_files([str(dest.resolve())])
+                        self.log(f"← 图片已保存并放入剪贴板文件: {dest.name}")
+                    except Exception as e:
+                        self.log(f"← 图片写入失败: {e}")
+            else:
+                self.log("← 收到空图片")
         elif t == "file_offer":
             self._on_file_offer(m)
         elif t == "file_offer_autopull":
@@ -928,6 +1132,21 @@ class LanCopyEngine:
                 return
             self._last_hdrop_sig = sig
             self._send_file_offer(paths)
+            return
+        # QQ/微信等：剪贴板位图/PNG（非文件）
+        png = self._clip.get_image_png()
+        if png:
+            if len(png) > 40 * 1024 * 1024:
+                self.log(f"剪贴板图片过大（{self._fmt_size(len(png))}），跳过")
+                return
+            ih = clipboard_bytes_hash(png)
+            if ih == self._last_image_hash or self._clip.should_ignore_image(png):
+                self._last_image_hash = ih
+                return
+            self._last_image_hash = ih
+            seq = self._clip.next_seq()
+            if sess.send_clipboard_image(png, ih, seq):
+                self.log(f"→ 图片 ({self._fmt_size(len(png))})")
             return
         text = self._clip.get_text()
         if text is None:
@@ -1019,7 +1238,7 @@ class LanCopyEngine:
     # ---- 接收端：offer → 延迟剪贴板；粘贴时拉取 ----
 
     def _on_file_offer(self, m: dict) -> None:
-        """收到名单：只缓存，不下载；等用户点「拉取待传文件」或托盘菜单。"""
+        """收到名单：只缓存，不下载；顶部弹窗 / 托盘 / 按钮点「拉取」。"""
         offer_id = m.get("offer_id") or ""
         files = m.get("files") or []
         with self._remote_offer_lock:
@@ -1028,10 +1247,16 @@ class LanCopyEngine:
         total = sum(int(f.get("size") or 0) for f in files)
         self.log(
             f"← 文件名单 {len(files)} 个（{self._fmt_size(total)}）：{names}"
-            f"{'…' if len(files) > 5 else ''} — 请点「拉取待传文件」或托盘右键拉取"
+            f"{'…' if len(files) > 5 else ''} — 请在顶部弹窗点「拉取」或取消"
         )
-        self.post("pending_offer", count=len(files), total=total, names=names)
-        self.post("tray_tip", text=f"有 {len(files)} 个待传文件，点托盘「拉取待传文件」")
+        self.post(
+            "pending_offer",
+            count=len(files),
+            total=total,
+            names=names,
+            offer_id=offer_id,
+        )
+        self.post("tray_tip", text=f"有 {len(files)} 个待传文件，点顶部「拉取」")
 
     def _manual_pull_and_set_clipboard(self, offer_id: str) -> None:
         with self._auto_pull_lock:
@@ -1253,6 +1478,17 @@ class LanCopyEngine:
             daemon=True,
         ).start()
 
+    def discard_pending_offer(self) -> None:
+        """取消本次待传名单，不下载。"""
+        with self._remote_offer_lock:
+            offer = self._remote_offer
+            self._remote_offer = None
+        if offer:
+            self.log(f"已取消待传文件 offer={offer.get('offer_id') or ''}")
+        else:
+            self.log("没有待取消的文件名单")
+        self.post("pending_offer", count=0, total=0, names="", offer_id="")
+
     # ---- 主动发送（按钮/拖放）：仍走 offer+立即拉取到对端？改为直接流式推到对端接收目录 ----
     def send_paths(self, paths: list[str]) -> None:
         """拖放/按钮：只发名单，对端需点「拉取待传文件」才下载。"""
@@ -1295,6 +1531,8 @@ class App:
         self._connected = False
         self._tray_state = "idle"
         self._render_hooked = False
+        self._pull_popup = None  # type: ignore
+        self._instance_mutex = None
 
         self._build()
         self.root.after(200, self._poll_ui)
@@ -1302,7 +1540,47 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Unmap>", self._on_unmap)
         self.root.after(100, self._setup_hwnd_and_tray)
+        self.root.after(300, self._start_wake_server)
         self.root.after(400, self._auto_start)
+
+
+    def _start_wake_server(self) -> None:
+        """本机二次启动时通过 127.0.0.1 通知本实例显示窗口（含托盘隐藏）。"""
+        def run():
+            try:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("127.0.0.1", 0))
+                srv.listen(2)
+                port = srv.getsockname()[1]
+                try:
+                    _wake_signal_path().write_text(str(port), encoding="utf-8")
+                except Exception:
+                    pass
+                srv.settimeout(1.0)
+                while not self._exiting:
+                    try:
+                        conn, _ = srv.accept()
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        break
+                    try:
+                        conn.recv(64)
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    try:
+                        self.root.after(0, self._tray_show)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True, name="wake").start()
 
     def _setup_hwnd_and_tray(self) -> None:
         try:
@@ -1325,7 +1603,7 @@ class App:
         self._init_tray()
 
     def _hook_clipboard_render(self, hwnd: int) -> None:
-        """可选保留延迟渲染钩子；文件主路径已改为自动拉取。
+        """可选保留延迟渲染钩子；文件主路径为手动「拉取」。
 
         64 位 HWND/WNDPROC 必须用 pointer-sized ctypes，禁止把 .value 当 int 传入。
         """
@@ -1452,7 +1730,7 @@ class App:
         self.var_pending = tk.StringVar(value="")
         ttk.Label(row4, textvariable=self.var_pending, foreground="#c60").pack(side=tk.RIGHT, padx=6)
 
-        tip = "文字即时同步；文件复制只传名单，对端点「拉取待传文件」（窗口按钮或托盘右键）才下载，避免误传。"
+        tip = "文字/图片即时同步；文件复制只传名单，对端顶部弹窗点「拉取」才下载（托盘右键备用）。"
         if _HAS_TRAY:
             tip += " 关闭/最小化进托盘。"
         ttk.Label(frm, text=tip, foreground="#666", wraplength=600).pack(anchor=tk.W, padx=6)
@@ -1467,7 +1745,7 @@ class App:
         self.log.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
         self._enable_dnd(self.log)
 
-        self._append_log(f"{APP_NAME} 已就绪。自动发现同伴；文件需点「拉取待传文件」或托盘右键才下载。")
+        self._append_log(f"{APP_NAME} 已就绪。自动发现同伴；文字/图片即时同步；文件顶部弹窗点「拉取」。")
         self._append_log(f"本机 IP: {' / '.join(ips)}  TCP {DEFAULT_PORT} / UDP {DISCOVER_PORT}")
 
     def _enable_dnd(self, widget: Any) -> None:
@@ -1506,7 +1784,103 @@ class App:
             threading.Thread(target=self.engine.send_paths, args=(list(files),), daemon=True).start()
 
     def _pull_pending(self) -> None:
+        self._close_pull_popup()
         self.engine.pull_pending_now()
+
+    def _cancel_pending(self) -> None:
+        self._close_pull_popup()
+        self.engine.discard_pending_offer()
+
+    def _close_pull_popup(self) -> None:
+        win = self._pull_popup
+        self._pull_popup = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _show_pull_popup(self, count: int, total: int, names: str) -> None:
+        """屏幕正上方中间、置顶覆盖其他窗口的拉取确认条。"""
+        self._close_pull_popup()
+        _ensure_tk()
+        win = tk.Toplevel(self.root)
+        self._pull_popup = win
+        win.title("待传文件")
+        win.resizable(False, False)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            win.attributes("-toolwindow", True)
+        except Exception:
+            pass
+        # 最高优先级：短暂置顶 + lift + 强制前台
+        try:
+            win.lift()
+            win.focus_force()
+        except Exception:
+            pass
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        size_txt = ""
+        try:
+            size_txt = f"（{self.engine._fmt_size(total)}）" if total else ""
+        except Exception:
+            size_txt = ""
+        label = (
+            f"对端有 {count} 个文件待传输{size_txt}"
+            + (f"：{names}" if names else "")
+        )
+        ttk.Label(frm, text=label, wraplength=420).pack(anchor=tk.W, pady=(0, 10))
+        btns = ttk.Frame(frm)
+        btns.pack(fill=tk.X)
+        pull_btn = tk.Button(
+            btns,
+            text="拉取",
+            width=10,
+            command=self._pull_pending,
+            bg="#1a7f37",
+            fg="white",
+            activebackground="#146c2e",
+            activeforeground="white",
+        )
+        pull_btn.pack(side=tk.LEFT, padx=(0, 8))
+        cancel_btn = tk.Button(
+            btns,
+            text="取消",
+            width=10,
+            command=self._cancel_pending,
+        )
+        cancel_btn.pack(side=tk.LEFT)
+        win.update_idletasks()
+        w = max(win.winfo_reqwidth(), 460)
+        h = win.winfo_reqheight()
+        sw = win.winfo_screenwidth()
+        x = max(0, (sw - w) // 2)
+        y = 12  # 屏幕正上方中间
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        # Windows: 置顶置前
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                hwnd = ctypes.c_void_p(int(win.winfo_id()))
+                parent = user32.GetParent(hwnd)
+                top = hwnd
+                while parent:
+                    top = ctypes.c_void_p(parent)
+                    parent = user32.GetParent(top)
+                HWND_TOPMOST = ctypes.c_void_p(-1)
+                SWP_NOMOVE = 0x0002
+                SWP_NOSIZE = 0x0001
+                SWP_SHOWWINDOW = 0x0040
+                user32.SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            except Exception:
+                pass
+        win.protocol("WM_DELETE_WINDOW", self._cancel_pending)
 
     def _auto_start(self) -> None:
         try:
@@ -1568,20 +1942,21 @@ class App:
                     n = int(msg.get("count") or 0)
                     if n > 0:
                         names = msg.get("names") or ""
+                        total = msg.get("total") or 0
                         self.var_pending.set(f"待传 {n} 个" + (f"：{names}" if names else ""))
                         try:
                             self.btn_pull.config(bg="#d97706", activebackground="#b45309")
                         except Exception:
                             pass
-                        if not self.root.winfo_viewable():
-                            # 缩在托盘时额外提醒一次
-                            self._tray_notify(msg.get("names") and f"有待传文件：{names}" or f"有 {n} 个待传文件")
+                        self._show_pull_popup(n, total, names)
+                        self._tray_notify(msg.get("names") and f"有待传文件：{names}" or f"有 {n} 个待传文件")
                     else:
                         self.var_pending.set("")
                         try:
                             self.btn_pull.config(bg="#1a7f37", activebackground="#146c2e")
                         except Exception:
                             pass
+                        self._close_pull_popup()
                 elif kind == "tray_tip":
                     self._tray_notify(msg.get("text") or "")
                 elif kind == "open_dir":
@@ -1704,9 +2079,70 @@ class App:
         self.root.mainloop()
 
 
-def main() -> None:
-    App().run()
+def _wake_signal_path() -> Path:
+    return Path(os.environ.get("TEMP") or os.environ.get("TMP") or ".") / "lancopy_wake.port"
 
+
+def _activate_existing_window() -> bool:
+    """唤醒已运行实例（TCP 通知优先，失败再 FindWindow）。"""
+    try:
+        wp = _wake_signal_path()
+        if wp.is_file():
+            port = int((wp.read_text(encoding="utf-8") or "0").strip() or "0")
+            if port > 0:
+                s = socket.create_connection(("127.0.0.1", port), timeout=0.8)
+                try:
+                    s.sendall(b"SHOW\n")
+                finally:
+                    s.close()
+                return True
+    except Exception:
+        pass
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        for title in (APP_NAME, f"{APP_NAME} - 未连接", f"{APP_NAME} - 已连接"):
+            hwnd = user32.FindWindowW(None, title)
+            if hwnd:
+                SW_RESTORE = 9
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                user32.SetForegroundWindow(hwnd)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def acquire_single_instance():
+    """Windows 命名互斥量；已存在则激活旧窗口并返回 None。"""
+    if sys.platform != "win32":
+        return True  # non-windows: allow
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        # Local\ 避免需要管理员
+        name = "Local\\LanCopy_SingleInstance_v1"
+        handle = kernel32.CreateMutexW(None, False, name)
+        ERROR_ALREADY_EXISTS = 183
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            _activate_existing_window()
+            return None
+        return handle
+    except Exception:
+        return True
+
+
+def main() -> None:
+    mutex = acquire_single_instance()
+    if mutex is None:
+        return
+    app = App()
+    app._instance_mutex = mutex
+    app.run()
 
 if __name__ == "__main__":
     main()
